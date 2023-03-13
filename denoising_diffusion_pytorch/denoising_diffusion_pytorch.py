@@ -462,7 +462,6 @@ class GaussianDiffusion(nn.Module):
         assert not model.random_or_learned_sinusoidal_cond
 
         self.model = model
-
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
 
@@ -516,7 +515,7 @@ class GaussianDiffusion(nn.Module):
         register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
 
         # calculations for posterior q(x_{t-1} | x_t, x_0)
-
+        # q(x_{t-1} | x_t, x_0)的方差
         posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
 
         # above: equal to 1. / (1. / (1. - alpha_cumprod_tm1) + alpha_t / beta_t)
@@ -525,8 +524,11 @@ class GaussianDiffusion(nn.Module):
 
         # below: log calculation clipped because the posterior variance is 0 at the beginning of the diffusion chain
 
+        # q(x_{t-1} | x_t, x_0)的方差取对数
         register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min =1e-20)))
+        # q(x_{t-1} | x_t, x_0)的期望\mu(x_t, x_0) = A * x_t + B * x_0 中的 B
         register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        # q(x_{t-1} | x_t, x_0)的期望\mu(x_t, x_0) = A * x_t + B * x_0 中的 A
         register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
         # calculate p2 reweighting
@@ -539,6 +541,7 @@ class GaussianDiffusion(nn.Module):
         self.unnormalize = unnormalize_to_zero_to_one if auto_normalize else identity
 
     def predict_start_from_noise(self, x_t, t, noise):
+        # 从x_t导出x_0，根据x_t = \sqrt(\bar{x}_t) * x_0 + \sqrt(1 - \bar{\alpha}_t) * \epsilon
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
@@ -563,6 +566,7 @@ class GaussianDiffusion(nn.Module):
         )
 
     def q_posterior(self, x_start, x_t, t):
+        # \mu_t = posterior_mean_coef1 * x_0 + posterior_mean_coef2 * x_t
         posterior_mean = (
             extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
             extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
@@ -572,6 +576,9 @@ class GaussianDiffusion(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
+        """
+        走从x_t生成x_{t-1}的过程
+        """
         model_output = self.model(x, t, x_self_cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
@@ -608,10 +615,15 @@ class GaussianDiffusion(nn.Module):
 
     @torch.no_grad()
     def p_sample(self, x, t: int, x_self_cond = None):
+        """
+        t: 依次取0，1，2，3，4，5，6，7……
+        """
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
+        # 应该从N(mu=model_mean, var=exp(model_log_variance))中采样得到pred_img，但是我们用重参数技巧，
+        # 从标准高斯中采样epsilon，然后用mu+标准差*epsilon得到pred_img，这里0.5*没看懂
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
@@ -626,6 +638,8 @@ class GaussianDiffusion(nn.Module):
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
+            # img开始是个噪声,即X_T
+            # x_start是每次根据x_t和模型预测出的epsilon噪声，得到的x_0
             img, x_start = self.p_sample(img, t, self_cond)
             imgs.append(img)
 
@@ -703,8 +717,14 @@ class GaussianDiffusion(nn.Module):
         return img
 
     def q_sample(self, x_start, t, noise=None):
+        """
+        从x0生成xt
+        x_start: img
+        t: 随机生成的batch size个时间数，都小于num_timesteps
+        """
         noise = default(noise, lambda: torch.randn_like(x_start))
 
+        # x_t = \sqrt(\bar{\alpha}_t) * x_{0} + \sqrt(1-\bar{\alpha}_t) * \epsilon
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
@@ -724,7 +744,8 @@ class GaussianDiffusion(nn.Module):
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         # noise sample
-
+        # 就是x_t，注意这里是从x_0施加噪声直接得到x_t的，后面noise作为label，
+        # 也就是unet预测的是x_0到x_t的噪声，而不是x_{t-1}到x_t的噪声
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
@@ -751,6 +772,8 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
+        # 这个target是noise，这个noise施加在x_0上，直接得到x_t
+        # 用unet输入x_t和t，然后得到预测的noise，用预测的noise和真实的noise做mse
         loss = self.loss_fn(model_out, target, reduction = 'none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
 
